@@ -1,67 +1,62 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2s.h"
+#include "driver/i2s_pdm.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 
 static const char *TAG = "mic_test";
 
-#define I2S_NUM         I2S_NUM_0  // I2S peripheral number
-#define SAMPLE_RATE     16000      // Sample rate in Hz
-#define SAMPLE_BITS     16         // Sample bits
-#define CHANNEL_NUM     1          // Number of channels (1 for mono, 2 for stereo)
-#define DMA_BUF_COUNT   8          // Number of DMA buffers
-#define DMA_BUF_LEN     1024       // Length of each DMA buffer
+#define I2S_CLK       GPIO_NUM_42
+#define I2S_DIN       GPIO_NUM_41
+
+#define SAMPLE_RATE   44100
+#define SAMPLE_BITS   16
+#define DMA_BUF_COUNT 8
+#define DMA_BUF_LEN   1024
+
+static i2s_chan_handle_t rx_handle = NULL;
+
+static int32_t calculate_audio_level(int16_t* samples, size_t count) {
+    int32_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += abs(samples[i]);
+    }
+    return sum / count;
+}
 
 void app_main(void)
 {
-    // Configure I2S
-    i2s_config_t i2s_config = {
-        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = SAMPLE_BITS,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = DMA_BUF_COUNT,
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
+    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_handle));
+
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = I2S_CLK,
+            .din = I2S_DIN,
+            .invert_flags = {
+                .clk_inv = false,
+            },
+        },
     };
+    ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(rx_handle, &pdm_rx_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
 
-    // Install and start I2S driver
-    ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL));
+    static int16_t samples[DMA_BUF_LEN];
+    size_t bytes_read = 0;
+    int32_t audio_level;
 
-    // Configure I2S pins
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = 26,    // Bit clock pin
-        .ws_io_num = 25,     // Word select pin
-        .data_out_num = -1,  // Not used for mic input
-        .data_in_num = 22    // Data input pin
-    };
-    ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM, &pin_config));
-
-    // Buffer for audio samples
-    int32_t samples[1024];
-    size_t bytes_read;
-
-    ESP_LOGI(TAG, "Microphone test initialized. Starting to read audio samples...");
+    ESP_LOGI(TAG, "Starting mic test...");
 
     while (1) {
-        // Read audio samples
-        i2s_read(I2S_NUM, samples, sizeof(samples), &bytes_read, portMAX_DELAY);
+        ESP_ERROR_CHECK(i2s_channel_read(rx_handle, samples, sizeof(samples), &bytes_read, portMAX_DELAY));
         
-        // Calculate average amplitude for basic audio level monitoring
-        int32_t sum = 0;
-        int samples_read = bytes_read / sizeof(int32_t);
-        
-        for (int i = 0; i < samples_read; i++) {
-            sum += abs(samples[i]);
+        if (bytes_read > 0) {
+            audio_level = calculate_audio_level(samples, bytes_read / sizeof(int16_t));
+            ESP_LOGI(TAG, "Audio level: %ld", audio_level);
         }
-        
-        int32_t average = sum / samples_read;
-        ESP_LOGI(TAG, "Average audio level: %ld", average);
         
         vTaskDelay(pdMS_TO_TICKS(100));
     }
